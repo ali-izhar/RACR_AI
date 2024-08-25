@@ -7,16 +7,20 @@ tracr is a batteries-included platform that allows users to quickly design and r
 ## Installation
 
 ### Requirements
+
 We try to limit dependencies as much as possible, but there are a few. Please review the following requirements before installing tracr:
 
 #### Operating System
+
 Tracr does not officially support Windows, but it should work on any UNIX-like system, including WSL. It has been tested on Ubuntu 20.04 and 21.04.
 
 #### Docker
+
 Docker is used to manage the deployment of services and experiments. To install Docker, follow the instructions for your operating system [here](https://docs.docker.com/get-docker/). If you are using WSL, you will also need to install Docker Desktop for Windows.
 
 #### open-ssh
-open-ssh is used to manage remote devices (*"Participants"*) from the local machine (*"Observer"*). All participants must have open-ssh installed and configured to allow passwordless login from the observer. To install open-ssh, run the following commands:
+
+open-ssh is used to manage remote devices (_"Participants"_) from the local machine (_"Observer"_). All participants must have open-ssh installed and configured to allow passwordless login from the observer. To install open-ssh, run the following commands:
 
 ```bash
 # For participants:
@@ -31,6 +35,7 @@ Additionally, the observer should have [passwordless login](https://phoenixnap.c
 ### Initial Setup
 
 To get started, clone the repository. (The location of the repository doesn't matter):
+
 ```bash
 git clone https://github.com/nbovee/RACR_AI.git
 ```
@@ -59,6 +64,7 @@ Congratulations - you are now ready to get started!
 ## Usage
 
 ### Overview
+
 The tracr source code is split into two main sections: `app_api` and `experiment_design`. The `app_api` directory contains the code that runs the tracr application, while the `experiment_design` directory contains the code that defines the behavior of the nodes that will be deployed to participating machines during experiment runtime. To define custom behavior for new experiments, you will extend the code in `experiment_design`. Generally, you will not need to modify the code in `app_api`.
 
 The `experiment_design` directory is split into a number of subdirectories, each representing a customizable part of an experiment. These subdirectories are structured as Python packages, and generally, the user will add a new file to the package and build subclasses of the base classes already defined in the package to implement custom behavior. The subdirectories are as follows:
@@ -73,25 +79,28 @@ The `experiment_design` directory is split into a number of subdirectories, each
 Once an experiment has been designed, it can be run with a single command.
 
 ### Designing Experiments
+
 At the most general level, designing an experiment is a matter of:
 
 1. **Defining the behavior** for each node involved in the experiment, which determines how each type of task is handled
 2. **Listing the tasks** that must be performed during the experiment
 3. **Specifying other parameters**, such as which nodes are deployed to which physical devices, what format to save the report in, etc.
 
-Listing tasks and specifying other parameters is done by creating an *Experiment Manifest* file, which is a YAML file that contains all of the information needed to run an experiment. Defining node behavior is naturally a bit more involved, and is done by extending the base code in `experiment_design`. Let's detail this part first.
+Listing tasks and specifying other parameters is done by creating an _Experiment Manifest_ file, which is a YAML file that contains all of the information needed to run an experiment. Defining node behavior is naturally a bit more involved, and is done by extending the base code in `experiment_design`. Let's detail this part first.
 
 #### Defining Node Behavior
-A *node*, in this context, is just an exposed RPC service that can be deployed to a physical device (implemented using the [RPyC](https://rpyc.readthedocs.io/en/latest/) library). Each node is responsible for handling a specific type of task. For example, a node might be responsible for performing the first half of an inference on an image, or for finishing that inference. Nodes are deployed to physical devices during experiment runtime, and are then used to perform the tasks that are specified in the experiment manifest.
 
-The vast majority of node behavior is controlled by extending the `ParticipantService` base class in `experiment_design/services/base.py`. An example of this can be found in the file `basic_split_inference.py` in the same directory, where two new types of nodes (`ClientService` and `EdgeService`) are defined. Looking through the example file, you will notice how little code is necessary to implement your own nodes. The basic process for creating a new type of node is as follows:
+A _node_, in this context, is just an exposed RPC service that can be deployed to a physical device (implemented using the [RPyC](https://rpyc.readthedocs.io/en/latest/) library). Each node is responsible for handling a specific type of task. For example, a node might be responsible for performing the first half of an inference on an image, or for finishing that inference. Nodes are deployed to physical devices during experiment runtime, and are then used to perform the tasks that are specified in the experiment manifest.
+
+The vast majority of node behavior is controlled by extending the `ParticipantService` base class in `experiment_design/services/base.py`. An example of this can be found in the file `basic_split_inference.py` in the same directory, where two new types of nodes (`ServerService` and `ParticipantService`) are defined. Looking through the example file, you will notice how little code is necessary to implement your own nodes. The basic process for creating a new type of node is as follows:
 
 1. **Create a new class** that extends `ParticipantService`. This class can be defined in its own Python file, or if it's related to other types of nodes, it can be defined in the same file with them.
 2. **Override class attributes** `aliases` and `partners`. The `aliases` attribute is a list of strings. The first should be the name of the node, and the second should be the string "PARTICIPANT". The `partners` attribute is a list of strings, where each string is the name of a node that this node can communicate with.
 3. **Override methods associated with each type of task** that this node can perform. The dictionary defining these associations is implemented in the base class as the attribute `self.task_map`. To program the node to handle a certain task in a specific way, simply override the method associated with that task.
 
 #### Listing the Tasks
-Once the node behavior has been defined, the next step is to list the tasks that must be performed during the experiment. This is done inside the *Experiment Manifest* file, which is a YAML file that contains all of the information needed to run an experiment. It should live inside of its own directory within `UserData/TestCases`. An example manifest can be found in `UserData/TestCases/AlexnetSplit/alexnetsplit.yaml`.
+
+Once the node behavior has been defined, the next step is to list the tasks that must be performed during the experiment. This is done inside the _Experiment Manifest_ file, which is a YAML file that contains all of the information needed to run an experiment. It should live inside of its own directory within `UserData/TestCases`. An example manifest can be found in `UserData/TestCases/AlexnetSplit/alexnetsplit.yaml`.
 
 The manifest is split into three sections:
 
@@ -99,14 +108,16 @@ The manifest is split into three sections:
 2. **participant_instances**: Defines a specific instance of a participant node by pointing to one of the participant types defined in the previous section, as well as the physical device that the node will be deployed to.
 3. **playbook**: Defines the sequence of tasks that will be completed during the experiment by assigning a list of tasks to each participant instance from the previous section. These tasks include the task type, and the arguments that will be passed to the task object itself.
 
-The *playbook* section is the focus of this part of the documentation. When an experiment begins, the *Observer* node will iterate through the playbook, use the task name and params to construct a task object, and then send that task object to the appropriate participant node (for all tasks). The participant node stores these tasks in its inbox, which is a PriorityQueue that sorts tasks in a logical order.
+The _playbook_ section is the focus of this part of the documentation. When an experiment begins, the _Observer_ node will iterate through the playbook, use the task name and params to construct a task object, and then send that task object to the appropriate participant node (for all tasks). The participant node stores these tasks in its inbox, which is a PriorityQueue that sorts tasks in a logical order.
 
 Once all the tasks have been sent and the handshake sequence has finished, the participant node will begin processing tasks from its inbox in order of priority. The priority of a task is determined by the task object itself, and is used to ensure that tasks are processed in the correct order. Different types of tasks will have different parameters that must be included in the playbook; check their constructor arguments in `tasks/tasks.py` to see what is required.
 
 #### Specifying Other Parameters
-The last step is to specify other parameters, such as which nodes are deployed to which physical devices, what format to save the report in, etc. This, again, is done by editing the *Experiment Manifest* file. Use the *participant_instances* section of the manifest to map participant types to physical devices. More options for experiment customization will be added here soon.
+
+The last step is to specify other parameters, such as which nodes are deployed to which physical devices, what format to save the report in, etc. This, again, is done by editing the _Experiment Manifest_ file. Use the _participant_instances_ section of the manifest to map participant types to physical devices. More options for experiment customization will be added here soon.
 
 ### Running Experiments
+
 Once an experiment has been designed, it can be run with a single command:
 
 ```bash

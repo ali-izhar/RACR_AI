@@ -1,21 +1,21 @@
 from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Type, Any
 import atexit
 import logging
 import threading
-import uuid
-import queue
-from queue import PriorityQueue
-from abc import ABC, abstractmethod
-import time
-import socket
 import pandas as pd
-from typing import Dict, List, Optional, Type, Any
+import queue
 import rpyc
-from rpyc.core.protocol import Connection, PingError
-from rpyc.utils.classic import obtain, deliver
-from rpyc.lib.compat import pickle
+import time
+import uuid
+from queue import PriorityQueue
 from time import sleep
-from rpyc.utils.factory import DiscoveryError, discover
+import rpyc.core
+from rpyc.core.protocol import Connection, PingError
+from rpyc.lib.compat import pickle
+from rpyc.utils.classic import obtain
+from rpyc.utils.factory import DiscoveryError
 from rpyc.utils.registry import UDPRegistryClient, REGISTRY_PORT
 
 from ..master_dict import MasterDict
@@ -37,18 +37,55 @@ logger = logging.getLogger("tracr_logger")
 
 rpyc.core.protocol.DEFAULT_CONFIG["allow_pickle"] = True
 rpyc.core.protocol.DEFAULT_CONFIG["allow_public_attrs"] = True
+rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = 60
+rpyc.core.protocol.DEFAULT_CONFIG["async_request_timeout"] = 60
 
 
 class HandshakeFailureException(Exception):
-    """Raised when a node fails to establish a handshake with its specified partners."""
+    """
+    Raised if a node fails to establish a handshake with any of its specified partners.
+    """
 
-    pass
+    def __init__(self, message):
+        super().__init__(message)
 
 
 class AwaitParticipantException(Exception):
-    """Raised when the observer node waits too long for a participant node to become ready."""
+    """
+    Raised if the observer node waits too long for a participant node to change its status to
+    "ready".
+    """
+
+    def __init__(self, message):
+        super().__init__(message)
+
+
+class RetryableError(Exception):
+    """Base class for retryable errors."""
 
     pass
+
+
+def retry_operation(max_attempts=3, delay=5):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except RetryableError as e:
+                    if attempt == max_attempts - 1:
+                        logger.error(
+                            f"Operation failed after {max_attempts} attempts: {str(e)}"
+                        )
+                        raise
+                    logger.warning(
+                        f"Operation failed (attempt {attempt + 1}/{max_attempts}). Retrying in {delay} seconds..."
+                    )
+                    time.sleep(delay)
+
+        return wrapper
+
+    return decorator
 
 
 @rpyc.service
@@ -65,24 +102,20 @@ class NodeService(rpyc.Service, ABC):
         self.threadlock = threading.RLock()
         self.inbox: PriorityQueue[Task] = PriorityQueue()
         self.partners: List[str] = []
+        self.heartbeats = {}
         logger.info(f"{self.node_name} initialized")
 
-    def on_connect(self, conn: Connection) -> None:
-        """Handle new connections to the node."""
+    def on_connect(self, conn: Connection):
         with self.threadlock:
             try:
-                # Check if the connected service has the get_node_name method
-                if hasattr(conn.root, 'get_node_name'):
-                    node_name = conn.root.get_node_name()
-                    logger.info(f"{self.node_name} received connection from {node_name}")
-                    self.active_connections[node_name] = conn
-                else:
-                    # If get_node_name is not available, use a generic name
-                    generic_name = f"Unknown-{len(self.active_connections)}"
-                    logger.info(f"{self.node_name} received connection from {generic_name}")
-                    self.active_connections[generic_name] = conn
-            except Exception as e:
-                logger.error(f"{self.node_name} error in on_connect: {str(e)}")
+                node_name = conn.root.get_node_name()
+            except AttributeError:
+                # must be the VoidService exposed by the Experiment object, not another NodeService
+                node_name = "APP.PY"
+            logger.debug(
+                f"Received connection from {node_name}. Adding to saved connections."
+            )
+            self.active_connections[node_name] = conn
 
     def on_disconnect(self, _: Any) -> None:
         """Handle disconnections from the node."""
@@ -97,41 +130,35 @@ class NodeService(rpyc.Service, ABC):
                     logger.info(f"{self.node_name} disconnected from {name}")
                     self.active_connections[name] = None
 
+    @retry_operation(max_attempts=5, delay=10)
     def get_connection(self, node_name: str) -> Connection:
-        """Get or establish a connection to another node."""
         with self.threadlock:
             node_name = node_name.upper().strip()
-            original_node_name = node_name
             if node_name == "EDGE1":
                 node_name = "PARTICIPANT"
-                logger.warning(
-                    f"{self.node_name} mapping EDGE1 to PARTICIPANT for connection"
-                )
 
-            result = self.active_connections.get(node_name)
-            if result is not None:
-                logger.debug(
-                    f"{self.node_name} using saved connection to {original_node_name}"
-                )
-                return result
+            if (
+                node_name in self.active_connections
+                and self.active_connections[node_name] is not None
+            ):
+                try:
+                    self.active_connections[node_name].ping()
+                    return self.active_connections[node_name]
+                except Exception:
+                    logger.warning(
+                        f"Existing connection to {node_name} is stale. Establishing new connection."
+                    )
 
-            logger.info(
-                f"{self.node_name} attempting to connect to {original_node_name}"
-            )
             try:
                 conn = rpyc.connect_by_service(
-                    node_name, service=self, config=rpyc.core.protocol.DEFAULT_CONFIG
+                    node_name, config=rpyc.core.protocol.DEFAULT_CONFIG
                 )
-                self.active_connections[original_node_name] = conn
-                logger.info(
-                    f"{self.node_name} new connection to {original_node_name} established"
-                )
+                self.active_connections[node_name] = conn
+                logger.info(f"New connection to {node_name} established")
                 return conn
             except Exception as e:
-                logger.error(
-                    f"{self.node_name} failed to connect to {original_node_name}: {str(e)}"
-                )
-                raise
+                logger.error(f"Failed to connect to {node_name}: {str(e)}")
+                raise RetryableError(f"Failed to connect to {node_name}")
 
     def handshake(self) -> None:
         """Establish connections with partner nodes."""
@@ -163,23 +190,17 @@ class NodeService(rpyc.Service, ABC):
             logger.error(f"{self.node_name} could not handshake with {stragglers}")
             raise HandshakeFailureException(f"Failed to handshake with {stragglers}")
 
+    @retry_operation(max_attempts=3, delay=5)
     def send_task(self, node_name: str, task: Task) -> None:
-        """Send a task to another node."""
-        logger.info(f"{self.node_name} sending {task.task_type} to {node_name}")
-        pickled_task = pickle.dumps(task)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                conn = self.get_connection(node_name)
-                conn.root.accept_task(pickled_task)
-                logger.info(f"{self.node_name} successfully sent task to {node_name}")
-                return
-            except Exception as e:
-                logger.error(
-                    f"{self.node_name} failed to send task to {node_name}, attempt {attempt + 1}: {str(e)}"
-                )
-                if attempt == max_retries - 1:
-                    raise
+        logger.info(f"Sending {task.task_type} to {node_name}")
+        pickled_task = bytes(pickle.dumps(task))
+        conn = self.get_connection(node_name)
+        try:
+            conn.root.accept_task(pickled_task)
+            logger.info(f"Successfully sent task to {node_name}")
+        except Exception as e:
+            logger.error(f"Error sending task to {node_name}: {str(e)}")
+            raise RetryableError(f"Failed to send task to {node_name}")
 
     @rpyc.exposed
     def accept_task(self, pickled_task: bytes) -> None:
@@ -274,25 +295,35 @@ class ObserverService(NodeService):
             node_name = node_name.upper().strip()
             if node_name == "EDGE1":
                 node_name = "PARTICIPANT"
-            
+
             logger.debug(f"Attempting to discover {node_name} services")
             try:
                 registrar = UDPRegistryClient(ip="255.255.255.255", port=REGISTRY_PORT)
                 services = registrar.discover(node_name)
                 logger.debug(f"Discovered services for {node_name}: {services}")
-                
+
                 if services:
                     for host, port in services:
                         try:
-                            logger.debug(f"Attempting to connect to {node_name} at {host}:{port}")
-                            conn = rpyc.connect(host, port, config=rpyc.core.protocol.DEFAULT_CONFIG)
+                            logger.debug(
+                                f"Attempting to connect to {node_name} at {host}:{port}"
+                            )
+                            conn = rpyc.connect(
+                                host, port, config=rpyc.core.protocol.DEFAULT_CONFIG
+                            )
                             if conn.root:
                                 self.connections[node_name] = conn
-                                logger.info(f"New connection to {node_name} established and saved.")
+                                logger.info(
+                                    f"New connection to {node_name} established and saved."
+                                )
                                 return conn
                         except Exception as e:
-                            logger.warning(f"Failed to connect to {node_name} at {host}:{port}: {str(e)}")
-                    raise Exception(f"Failed to connect to any discovered service for {node_name}")
+                            logger.warning(
+                                f"Failed to connect to {node_name} at {host}:{port}: {str(e)}"
+                            )
+                    raise Exception(
+                        f"Failed to connect to any discovered service for {node_name}"
+                    )
                 else:
                     raise Exception(f"No services found for {node_name}")
             except Exception as e:
@@ -304,7 +335,9 @@ class ObserverService(NodeService):
         for partner in self.partners:
             for attempt in range(10):
                 try:
-                    logger.info(f"Attempting to connect to {partner} (Attempt {attempt + 1}/10)")
+                    logger.info(
+                        f"Attempting to connect to {partner} (Attempt {attempt + 1}/10)"
+                    )
                     conn = self.get_connection(partner)
                     if not conn or not conn.root:
                         raise Exception("Connected, but root is None")
@@ -315,9 +348,13 @@ class ObserverService(NodeService):
                     logger.info(f"Successfully connected to {partner}")
                     break
                 except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} to connect to {partner} failed: {str(e)}")
+                    logger.warning(
+                        f"Attempt {attempt + 1} to connect to {partner} failed: {str(e)}"
+                    )
                     if attempt == 9:  # Last attempt
-                        raise AwaitParticipantException(f"Failed to connect to {partner} after 10 attempts")
+                        raise AwaitParticipantException(
+                            f"Failed to connect to {partner} after 10 attempts"
+                        )
                     sleep(10)
 
         success = self._wait_for_participants()
@@ -343,27 +380,27 @@ class ObserverService(NodeService):
         logger.info(f"get_status called. Current status: {self.status}")
         return self.status
 
-    def _wait_for_participants(self, timeout: int = 120) -> bool:
+    @retry_operation(max_attempts=5, delay=10)
+    def _wait_for_participants(self, timeout: int = 300) -> bool:
         logger.info("Observer _wait_for_participants method called.")
         start_time = time.time()
         while time.time() - start_time < timeout:
-            for _ in range(20):
-                all_ready = True
-                for p in self.partners:
-                    try:
-                        status = self.get_connection(p).root.get_status()
-                        logger.info(f"Status of {p}: {status}")
-                        if status != "ready":
-                            all_ready = False
-                            break
-                    except Exception as e:
-                        logger.warning(f"Error checking status of {p}: {str(e)}")
+            all_ready = True
+            for p in self.partners:
+                try:
+                    status = self.get_connection(p).root.get_status()
+                    logger.info(f"Status of {p}: {status}")
+                    if status != "ready":
                         all_ready = False
                         break
-                if all_ready:
-                    logger.info("All participants are ready!")
-                    return True
-                sleep(10)
+                except Exception as e:
+                    logger.warning(f"Error checking status of {p}: {str(e)}")
+                    all_ready = False
+                    break
+            if all_ready:
+                logger.info("All participants are ready!")
+                return True
+            time.sleep(10)
         logger.warning(f"Timeout reached while waiting for participants")
         return False
 
@@ -492,6 +529,20 @@ class ParticipantService(NodeService):
         self.tasks_completed = 0
 
     @rpyc.exposed
+    def prepare_model(self, model: Optional[ModelInterface] = None) -> None:
+        """Prepare the model for the participant."""
+        logger.info(f"{self.node_name} preparing model.")
+        if model is not None:
+            self.model = model
+            # Ensure the model has a reference to the master dictionary
+            if hasattr(self.model, "master_dict") and self.model.master_dict is None:
+                observer_svc = self.get_connection("OBSERVER").root
+                self.model.master_dict = observer_svc.get_master_dict()
+            logger.info(f"{self.node_name} model set successfully.")
+        else:
+            logger.warning(f"{self.node_name} no model provided.")
+
+    @rpyc.exposed
     def get_ready(self) -> None:
         logger.info(f"{self.node_name} get_ready method called")
         with self.run_lock:
@@ -518,6 +569,7 @@ class ParticipantService(NodeService):
                     f"{self.node_name} run called when status is not ready. Current status: {self.status}"
                 )
 
+    @retry_operation(max_attempts=3, delay=5)
     def _run(self) -> None:
         logger.info(
             f"{self.node_name} _run method started. Current status: {self.status}"
@@ -534,17 +586,25 @@ class ParticipantService(NodeService):
                     logger.info(
                         f"{self.node_name} completed task. Total tasks completed: {self.tasks_completed}"
                     )
+
+                    if self.model is not None and hasattr(
+                        self.model, "update_master_dict"
+                    ):
+                        self.model.update_master_dict()
+
                     if isinstance(current_task, FinishSignalTask):
                         logger.info(
                             f"{self.node_name} received FinishSignalTask. Finishing experiment."
                         )
                         break
                 except queue.Empty:
-                    pass  # No tasks in the queue, continue waiting
+                    pass
                 except Exception as e:
-                    logger.error(f"Error processing task: {str(e)}")
+                    logger.error(f"Error processing task: {str(e)}", exc_info=True)
         except Exception as e:
-            logger.error(f"Error in {self.node_name} _run method: {str(e)}")
+            logger.error(
+                f"Error in {self.node_name} _run method: {str(e)}", exc_info=True
+            )
         finally:
             self.finish_experiment()
             logger.info(f"{self.node_name} _run method completed")
@@ -554,7 +614,7 @@ class ParticipantService(NodeService):
             f"{self.node_name} finishing experiment. Tasks completed: {self.tasks_completed}"
         )
         self.status = "finished"
-        if self.model is not None:
+        if self.model is not None and hasattr(self.model, "update_master_dict"):
             self.model.update_master_dict()
         logger.info(f"{self.node_name} experiment finished. Status: {self.status}")
 
@@ -574,16 +634,6 @@ class ParticipantService(NodeService):
         """Simple method to check if the service is responsive"""
         logger.info(f"{self.node_name} pinged")
         return f"{self.node_name} is alive"
-
-    @rpyc.exposed
-    def prepare_model(self, model: Optional[ModelInterface] = None) -> None:
-        """Prepare the model for the participant."""
-        logger.info(f"{self.node_name} preparing model.")
-        if model is not None:
-            self.model = model
-            logger.info(f"{self.node_name} model set successfully.")
-        else:
-            logger.warning(f"{self.node_name} no model provided.")
 
     @rpyc.exposed
     def self_destruct(self) -> None:
@@ -608,14 +658,13 @@ class ParticipantService(NodeService):
     def on_finish(self, task: Any) -> None:
         """Handle the completion of all tasks."""
         assert self.inbox.empty()
-        assert self.model is not None
-        self.model.update_master_dict()
+        if self.model is not None and hasattr(self.model, "update_master_dict"):
+            self.model.update_master_dict()
         self.status = "finished"
 
     def wait_for_tasks(self, task: WaitForTasksTask) -> None:
         """Handle the WaitForTasksTask."""
         logger.info(f"{self.node_name} waiting for tasks to complete")
-        # In a real scenario, you might want to implement actual waiting logic here
         time.sleep(5)  # Simulate waiting for 5 seconds
         logger.info(f"{self.node_name} finished waiting for tasks")
 
@@ -670,7 +719,6 @@ class ParticipantService(NodeService):
     def inference_sequence_per_input(self, task: SingleInputInferenceTask) -> None:
         logger.debug(f"Starting inference_sequence_per_input for task: {task}")
         try:
-            logger.debug(f"Starting inference_sequence_per_input for task: {task}")
             assert self.model is not None, "Model must be initialized before inference"
             input_data = task.input
             logger.debug(
@@ -737,7 +785,7 @@ class ParticipantService(NodeService):
 
                 for i, input_data in enumerate(inputs):
                     logger.debug(f"Processing input {i} from batch {batch_idx}")
-                    input_data = input_data.squeeze(0)  # Remove the extra dimension
+                    # input_data = input_data.squeeze(0)  # Remove the extra dimension
                     logger.debug(f"Input data shape: {input_data.shape}")
                     logger.debug(f"Input data type: {type(input_data)}")
                     subtask = SingleInputInferenceTask(input_data, from_node="SELF")

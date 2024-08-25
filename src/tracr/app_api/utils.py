@@ -8,16 +8,6 @@ from rpyc.utils.registry import REGISTRY_PORT, MAX_DGRAM_SIZE
 REMOTE_LOG_SVR_PORT = 9000
 
 
-# def get_repo_root() -> Path:
-#     """
-#     Returns the root directory of this repository as a pathlib.Path object.
-
-#     Returns:
-#         Path: Root directory of the repository.
-#     """
-#     return Path(__file__).parent.parent.parent.parent.absolute()
-
-
 def get_repo_root(
     markers: List[str] = [".git", "requirements.txt", "app.py", "pyproject.toml"]
 ) -> Path:
@@ -95,3 +85,13 @@ def log_server_is_up(port: int = REMOTE_LOG_SVR_PORT, timeout: int = 1) -> bool:
             return True
     except (OSError, socket.timeout, ConnectionRefusedError):
         return False
+
+
+def get_hostname() -> str:
+    """
+    Returns the hostname of the machine.
+
+    Returns:
+        str: Hostname of the machine.
+    """
+    return socket.gethostname()

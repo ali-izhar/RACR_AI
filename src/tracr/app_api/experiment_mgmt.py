@@ -1,6 +1,4 @@
 import atexit
-import csv
-from collections import defaultdict
 import logging
 import pathlib
 import pickle
@@ -8,13 +6,13 @@ import threading
 import yaml
 import rpyc
 import time
-import rpyc
-import rpyc.core.protocol
+import csv
+from collections import defaultdict
 from rpyc.utils.server import ThreadedServer
 from rpyc.utils.registry import UDPRegistryServer
 from rpyc.utils.classic import obtain
 from time import sleep
-from typing import Union, Any
+from typing import Union
 from datetime import datetime
 
 from . import utils
@@ -22,12 +20,15 @@ from . import device_mgmt as dm
 from .model_interface import ModelFactoryInterface
 from .deploy import ZeroDeployedServer
 from .services.base import ObserverService
-from .services.basic_split_inference import ClientService
+from .services.basic_split_inference import ServerService
 from .tasks import InferOverDatasetTask, FinishSignalTask, WaitForTasksTask
 
 # Overwrite default rpyc configs to allow pickling and public attribute access
 rpyc.core.protocol.DEFAULT_CONFIG["allow_pickle"] = True
 rpyc.core.protocol.DEFAULT_CONFIG["allow_public_attrs"] = True
+rpyc.core.protocol.DEFAULT_CONFIG["sync_request_timeout"] = 60
+rpyc.core.protocol.DEFAULT_CONFIG["async_request_timeout"] = 60
+
 
 TEST_CASE_DIR: pathlib.Path = (
     utils.get_repo_root() / "src" / "tracr" / "app_api" / "test_cases"
@@ -47,7 +48,8 @@ class ExperimentManifest:
         Args:
             manifest_fp (pathlib.Path): Path to the manifest file.
         """
-        p_types, p_instances, playbook_as_dict = self.read_and_parse_file(manifest_fp)
+        p_types, p_instances, playbook_as_dict = self.read_and_parse_file(
+            manifest_fp)
         self.name = manifest_fp.stem
         self.set_ptypes(p_types)
         self.set_p_instances(p_instances)
@@ -75,21 +77,9 @@ class ExperimentManifest:
         return participant_types, participant_instances, playbook
 
     def set_ptypes(self, ptypes: dict[str, dict]) -> None:
-        """
-        Sets the participant types.
-
-        Args:
-            ptypes (dict[str, dict]): Participant types.
-        """
         self.participant_types = ptypes
 
     def set_p_instances(self, pinstances: list[dict[str, str]]):
-        """
-        Sets the participant instances.
-
-        Args:
-            pinstances (list[dict[str, str]]): Participant instances.
-        """
         self.participant_instances = pinstances
 
     def create_and_set_playbook(
@@ -107,7 +97,7 @@ class ExperimentManifest:
                 assert isinstance(task_as_dict["task_type"], str)
                 task_type = task_as_dict["task_type"].lower()
 
-                if "infer" in task_type and "dataset" in task_type:
+                if "inf" in task_type and "dataset" in task_type:
                     params = task_as_dict["params"]
                     assert isinstance(params, dict)
                     task_object = InferOverDatasetTask(
@@ -119,7 +109,7 @@ class ExperimentManifest:
                     task_object = WaitForTasksTask()
                 else:
                     logger.warning(f"Unknown task type: {task_type}")
-                    continue  # Skip unknown task types instead of asserting
+                    continue
 
                 new_playbook[instance_name].append(task_object)
 
@@ -166,13 +156,11 @@ class ExperimentManifest:
                 if d._name == device or device.lower() == "any":
                     node_name = instance["instance_name"]
                     model_specs = self.participant_types[instance["node_type"]]["model"]
-                    logger.debug(f"model_spec: {model_specs}")
                     model_module = model_specs.get("module", "")
                     model_class = model_specs["class"]
                     model = (model_module, model_class)
-                    logger.debug(f"model_module: {model_module}")
-                    logger.debug(f"model_class: {model_class}")
-                    logger.debug(f"model_tuple: {model}")
+                    if "default" in model:
+                        model = ("", "")
                     service_specs = self.participant_types[instance["node_type"]][
                         "service"
                     ]
@@ -231,21 +219,26 @@ class Experiment:
         """
         Runs the experiment according to the current attributes set.
         """
-        self.threads["registry_svr"].start()
-        self.check_registry_server()
-        self.check_remote_log_server()
-        self.events["registry_ready"].wait()
+        try:
+            self.threads["registry_svr"].start()
+            self.check_registry_server()
+            self.check_remote_log_server()
+            self.events["registry_ready"].wait(timeout=60)
 
-        self.threads["observer_svr"].start()
-        self.check_observer_node()
-        self.events["observer_up"].wait()
+            self.threads["observer_svr"].start()
+            self.check_observer_node()
+            self.events["observer_up"].wait(timeout=60)
 
-        self.start_participant_nodes()
-        self.verify_all_nodes_up()
-        self.start_handshake()
-        self.wait_for_ready()
-        self.send_start_signal_to_observer()
-        self.cleanup_after_finished()
+            self.start_participant_nodes()
+            self.verify_all_nodes_up()
+            self.start_handshake()
+            self.wait_for_ready()
+            self.send_start_signal_to_observer()
+            self.cleanup_after_finished()
+        except Exception as e:
+            logger.error(
+                f"Error during experiment execution: {str(e)}", exc_info=True)
+            self.cleanup_after_finished(force=True)
 
     def start_registry(self) -> None:
         """
@@ -266,15 +259,17 @@ class Experiment:
 
     def check_registry_server(self):
         """
-        Checks if the registry server is up and running.
-
-        Raises:
-            TimeoutError: If the registry server takes too long to become available.
+        Checks if the registry server is up and running with increased timeout and retries.
         """
-        for _ in range(5):
+        max_attempts = 10
+        for attempt in range(max_attempts):
             if utils.registry_server_is_up():
                 self.events["registry_ready"].set()
                 return
+            logger.warning(
+                f"Registry server not up. Attempt {attempt + 1}/{max_attempts}"
+            )
+            time.sleep(5)
         raise TimeoutError("Registry server took too long to become available")
 
     def check_remote_log_server(self) -> None:
@@ -288,7 +283,8 @@ class Experiment:
             if utils.log_server_is_up():
                 logger.info("Remote log server is up and listening.")
                 return
-        raise TimeoutError("Remote log server took too long to become available")
+        raise TimeoutError(
+            "Remote log server took too long to become available")
 
     def start_observer_node(self) -> None:
         """
@@ -310,18 +306,17 @@ class Experiment:
 
     def check_observer_node(self) -> None:
         """
-        Checks if the observer node is up and running.
-
-        Raises:
-            TimeoutError: If the observer node takes too long to become available.
+        Checks if the observer node is up and running with increased timeout and retries.
         """
-        max_attempts = 10
-        delay = 2  # seconds
+        max_attempts = 20
+        delay = 3  # seconds
 
         for attempt in range(max_attempts):
             try:
                 services = rpyc.list_services()
-                logger.debug(f"Attempt {attempt + 1}/{max_attempts}: Available services: {services}")
+                logger.debug(
+                    f"Attempt {attempt + 1}/{max_attempts}: Available services: {services}"
+                )
 
                 if "OBSERVER" in services:
                     self.events["observer_up"].set()
@@ -337,7 +332,7 @@ class Experiment:
 
     def start_participant_nodes(self) -> None:
         """
-        Starts all participant nodes based on the manifest.
+        Starts all participant nodes based on the manifest with improved error handling.
         """
         logger.debug(
             f"Starting participant nodes. Available devices: {[d._name for d in self.available_devices]}"
@@ -346,79 +341,92 @@ class Experiment:
             self.available_devices
         )
         logger.debug(f"Got {len(zdeploy_node_param_list)} zdeploy params")
+
         for params in zdeploy_node_param_list:
             device, node_name, model_config, service_config = params
-            logger.debug(f"Processing node: {node_name}")
-            logger.debug(f"Device: {device._name}")
-            logger.debug(f"Device host: {device.get_current('host')}")
-            logger.debug(f"Device user: {device.get_current('user')}")
-            logger.debug(f"Creating model for {node_name} with config: {model_config}")
-            model = self.model_factory.create_model(config_path=model_config)
-            
-            # Extract module and class names from the WrappedModel
-            model_module = model.__class__.__module__
-            model_class = model.__class__.__name__
-            model_tuple = (model_module, model_class)
-            
-            logger.debug(f"Model tuple: {model_tuple}")
-            logger.debug(f"Creating ZeroDeployedServer for {node_name}")
             try:
-                node = ZeroDeployedServer(device, node_name, model_tuple, service_config)
+                model = self.model_factory.create_model(
+                    config_path=model_config)
+                model_module = model.__class__.__module__
+                model_class = model.__class__.__name__
+                model_tuple = (model_module, model_class)
+
+                logger.debug(f"Creating ZeroDeployedServer for {node_name}")
+                node = ZeroDeployedServer(
+                    device, node_name, model_tuple, service_config
+                )
                 self.participant_nodes.append(node)
-                logger.debug(f"Successfully created ZeroDeployedServer for {node_name}")
+                logger.debug(
+                    f"Successfully created ZeroDeployedServer for {node_name}")
 
-                # Wait for the node to register
                 self.wait_for_node_registration(node_name)
-
             except Exception as e:
-                logger.error(f"Failed to create ZeroDeployedServer for {node_name}: {str(e)}")
+                logger.error(
+                    f"Failed to create or register ZeroDeployedServer for {node_name}: {str(e)}",
+                    exc_info=True,
+                )
                 raise
 
-            logger.debug(f"Created {len(self.participant_nodes)} participant nodes")
+        logger.debug(
+            f"Created {len(self.participant_nodes)} participant nodes")
 
-    def wait_for_node_registration(self, node_name, max_attempts=20, sleep_time=5):
+    def wait_for_node_registration(self, node_name, max_attempts=30, sleep_time=5):
         logger.debug(f"Waiting for {node_name} to register")
         for attempt in range(max_attempts):
-            logger.debug(f"Attempt {attempt + 1}/{max_attempts} to find {node_name} in services")
+            logger.debug(
+                f"Attempt {attempt + 1}/{max_attempts} to find {node_name} in services"
+            )
             services = rpyc.list_services()
             logger.debug(f"Available services: {services}")
-            if node_name in services or (node_name == "EDGE1" and "PARTICIPANT" in services):
+            if node_name in services or (
+                node_name == "PARTICIPANT1" and "PARTICIPANT" in services
+            ):
                 logger.debug(f"{node_name} successfully registered")
                 return
             sleep(sleep_time)
         raise TimeoutError(f"Timeout waiting for {node_name} to register")
 
     def verify_all_nodes_up(self):
-        """
-        Verifies that all required nodes are up and running.
-
-        Raises:
-            TimeoutError: If required nodes take too long to become available.
-        """
         logger.info("Verifying required nodes are up.")
         service_names = self.manifest.get_participant_instance_names()
         service_names.append("OBSERVER")
-        n_attempts = 20
-        while n_attempts > 0:
-            available_services = rpyc.list_services()
-            logger.debug(f"Available services: {available_services}")
-            
-            all_services_up = all(
-                service in available_services or 
-                (service == "EDGE1" and "PARTICIPANT" in available_services)
-                for service in service_names
-            )
-            
-            if all_services_up:
-                logger.info("All required nodes are up and running.")
-                return
-            
-            n_attempts -= 1
-            sleep(15)
-        
+        max_attempts = 30
+        sleep_time = 10
+
+        for attempt in range(max_attempts):
+            try:
+                available_services = rpyc.list_services()
+                logger.debug(f"Available services: {available_services}")
+
+                all_services_up = all(
+                    service in available_services
+                    or (
+                        service in ["PARTICIPANT1", "PARTICIPANT"]
+                        and "PARTICIPANT" in available_services
+                    )
+                    for service in service_names
+                )
+
+                if all_services_up:
+                    logger.info("All required nodes are up and running.")
+                    return
+
+                logger.warning(
+                    f"Not all services are up. Attempt {attempt + 1}/{max_attempts}"
+                )
+                sleep(sleep_time)
+            except Exception as e:
+                logger.error(f"Error verifying nodes: {str(e)}", exc_info=True)
+                sleep(sleep_time)
+
         stragglers = [
-            service for service in service_names 
-            if service not in available_services and not (service == "EDGE1" and "PARTICIPANT" in available_services)
+            service
+            for service in service_names
+            if service not in available_services
+            and not (
+                service in ["PARTICIPANT1", "PARTICIPANT"]
+                and "PARTICIPANT" in available_services
+            )
         ]
         raise TimeoutError(
             f"Waited too long for the following services to register: {stragglers}"
@@ -439,10 +447,9 @@ class Experiment:
             TimeoutError: If the observer node takes too long to become ready.
         """
         logger.info("Waiting for observer to be ready...")
-        for _ in range(30):
+        for _ in range(15):
             try:
                 status = self.observer_conn.get_status()
-                logger.info(f"Observer status: {status}")
                 if status == "ready":
                     logger.info("Observer is ready.")
                     return
@@ -450,66 +457,83 @@ class Experiment:
                 logger.error(f"Error getting observer status: {str(e)}")
             time.sleep(10)
 
-        raise TimeoutError("Observer failed to become ready within the timeout period.")
+        raise TimeoutError(
+            "Observer failed to become ready within the timeout period.")
 
     def get_client_service(self):
         """
-        Returns the ClientService instance if it exists in the experiment.
+        Returns the ServerService instance if it exists in the experiment.
         """
         for node in self.participant_nodes:
-            if isinstance(node, ClientService):
+            if isinstance(node, ServerService):
                 return node
         return None
-    
+
     def send_start_signal_to_observer(self) -> None:
         """
         Sends the start signal to the observer node.
         """
         self.observer_conn.run()
 
-    def cleanup_after_finished(self, check_status_interval: int = 10) -> None:
-        """
-        Cleans up after the experiment has finished.
-
-        Args:
-            check_status_interval (int, optional): Interval to check the status. Defaults to 10.
-        """
+    def cleanup_after_finished(self, check_status_interval: int = 10, force: bool = False) -> None:
         try:
-            while True:
-                if self.observer_conn.get_status() == "finished":
-                    break
-                sleep(check_status_interval)
+            if not force:
+                while True:
+                    try:
+                        if self.observer_conn and self.observer_conn.get_status() == "finished":
+                            break
+                        sleep(check_status_interval)
+                    except Exception as e:
+                        logger.error(
+                            f"Error getting observer status: {str(e)}", exc_info=True)
+                        sleep(check_status_interval)
 
             sleep(5)
             logger.info("Consolidating results from master_dict")
-            async_md = rpyc.async_(self.observer_conn.get_master_dict)
-            master_dict_result = async_md(as_dataframe=False)  # Changed to False to get raw data
-            master_dict_result.wait()
-            self.report_data = obtain(master_dict_result.value)
+            try:
+                if self.observer_conn:
+                    async_md = rpyc.async_(self.observer_conn.get_master_dict)
+                    master_dict_result = async_md(as_dataframe=True)
+                    master_dict_result.wait()
+                    self.report_data = obtain(master_dict_result.value)
+                else:
+                    logger.warning(
+                        "Observer connection is None, unable to get master_dict")
+            except Exception as e:
+                logger.error(
+                    f"Error consolidating results: {str(e)}", exc_info=True)
 
         except Exception as e:
-            logger.error(f"Error during result consolidation: {str(e)}")
+            logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
 
         finally:
-            try:
-                if hasattr(self, 'observer_node'):
-                    self.observer_node.close()
-            except Exception as e:
-                logger.error(f"Error closing observer node: {str(e)}")
-
-            try:
-                if hasattr(self, 'registry_server'):
-                    self.registry_server.close()
-            except Exception as e:
-                logger.error(f"Error closing registry server: {str(e)}")
-
-            for p in getattr(self, 'participant_nodes', []):
-                try:
-                    p.close()
-                except Exception as e:
-                    logger.error(f"Error closing participant node: {str(e)}")
-
+            self._close_all_connections()
             self.save_report(summary=True)
+
+    def _close_all_connections(self):
+        """
+        Closes all connections and servers.
+        """
+        try:
+            if hasattr(self, "observer_node"):
+                self.observer_node.close()
+        except Exception as e:
+            logger.error(
+                f"Error closing observer node: {str(e)}", exc_info=True)
+
+        try:
+            if hasattr(self, "registry_server"):
+                self.registry_server.close()
+        except Exception as e:
+            logger.error(
+                f"Error closing registry server: {str(e)}", exc_info=True)
+
+        for p in getattr(self, "participant_nodes", []):
+            try:
+                p.close()
+            except Exception as e:
+                logger.error(
+                    f"Error closing participant node: {str(e)}", exc_info=True)
 
     def save_report(self, format: str = "csv", summary: bool = False) -> None:
         """
@@ -582,7 +606,8 @@ class Experiment:
             )
 
             # Assume transmission latency is the difference between total time and inference times
-            total_time = inference_data.get("total_time", client_time + edge_time)
+            total_time = inference_data.get(
+                "total_time", client_time + edge_time)
             transmission_latency = total_time - (client_time + edge_time)
 
             summary[inference_id]["split_layer"].append(split_layer)
@@ -596,7 +621,8 @@ class Experiment:
         # Calculate averages
         for inference_id, data in summary.items():
             for key, value in data.items():
-                summary[inference_id][key] = sum(value) / len(value) if value else 0
+                summary[inference_id][key] = sum(
+                    value) / len(value) if value else 0
 
         return dict(summary)
 

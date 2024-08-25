@@ -27,11 +27,19 @@ class MasterDict:
         """
         with self._lock:
             if key in self._data:
-                return  # Avoid overwriting existing data
-            if "layer_information" not in value:
-                raise ValueError(
-                    "Cannot integrate inference_dict without 'layer_information' field"
-                )
+                if value.get("layer_information"):
+                    layer_info = value["layer_information"]
+                    layer_info = {
+                        k: v
+                        for k, v in layer_info.items()
+                        if v["inference_time"] is not None
+                    }
+                    self._data[key]["layer_information"].update(layer_info)
+                else:
+                    raise ValueError(
+                        f"Cannot integrate inference_dict without 'layer_information' field"
+                    )
+                return
             self._data[key] = value
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
@@ -47,7 +55,9 @@ class MasterDict:
         with self._lock:
             return self._data.get(key)
 
-    def update(self, new_info: Dict[str, Dict[str, Any]], by_value: bool = True) -> None:
+    def update(
+        self, new_info: Dict[str, Dict[str, Any]], by_value: bool = True
+    ) -> None:
         """
         Update the dictionary with new information.
 
@@ -60,7 +70,8 @@ class MasterDict:
                 new_info = obtain(new_info)
             except Exception as e:
                 print(f"Error obtaining new_info: {e}")
-                new_info = pickle.loads(pickle.dumps(new_info))  # Fallback method
+                new_info = pickle.loads(
+                    pickle.dumps(new_info))  # Fallback method
         with self._lock:
             for inference_id, layer_data in new_info.items():
                 self.set(inference_id, layer_data)
@@ -129,9 +140,13 @@ class MasterDict:
         """
         with self._lock:
             inf_data = self._data[inference_id]
+            layer_ids = sorted(list(inf_data["layer_information"].keys()))
             start_node = inf_data["layer_information"][0]["completed_by_node"]
-            for layer_id, layer_info in inf_data["layer_information"].items():
-                if layer_info["completed_by_node"] != start_node:
+            for layer_id in layer_ids:
+                if (
+                    inf_data["layer_information"][layer_id]["completed_by_node"]
+                    != start_node
+                ):
                     return int(layer_id)
             return 0 if start_node == "CLIENT1" else 20
 
@@ -154,7 +169,8 @@ class MasterDict:
             transmission_latency = self.get_transmission_latency(
                 inference_id, split_layer
             )
-            inf_time_client, inf_time_edge = self.get_total_inference_time(inference_id)
+            inf_time_client, inf_time_edge = self.get_total_inference_time(
+                inference_id)
             time_to_result = inf_time_client + inf_time_edge + transmission_latency
             return (
                 split_layer,
@@ -224,7 +240,7 @@ class MasterDict:
         """
         with self._lock:
             return dict(self._data)
-        
+
     def __getitem__(self, key: str) -> Dict[str, Any]:
         return self.get(key)
 

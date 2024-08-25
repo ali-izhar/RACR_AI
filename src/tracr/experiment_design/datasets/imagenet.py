@@ -1,8 +1,11 @@
+# experiment_design/datasets/imagenet.py
+
 import pathlib
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple, Dict
 import torchvision.transforms as transforms
 from PIL import Image
+import torch
 from .dataset import BaseDataset
 
 logger = logging.getLogger("tracr_logger")
@@ -40,10 +43,10 @@ class ImagenetDataset(BaseDataset):
         self.IMG_DIRECTORY = self.DATA_SOURCE_DIRECTORY / "imagenet" / "sample_images"
         self.img_labels = self._load_labels(max_iter)
         self.img_dir = self.IMG_DIRECTORY
-        self.transform = transform
+        self.transform = transform or transforms.ToTensor()
         self.target_transform = target_transform
         self.img_map = self._create_image_map()
-        logger.info(f"Initialized ImagenetDataset with max_iter={max_iter}")
+        logger.info(f"Initialized ImagenetDataset with {len(self.img_labels)} images")
 
     def _load_labels(self, max_iter: int) -> list:
         """
@@ -55,15 +58,18 @@ class ImagenetDataset(BaseDataset):
         Returns:
             list: Processed list of image labels.
         """
-        with open(self.CLASS_TEXTFILE) as file:
-            img_labels = file.read().split("\n")
-        if max_iter > 0:
-            img_labels = img_labels[:max_iter]
+        try:
+            with open(self.CLASS_TEXTFILE) as file:
+                img_labels = file.read().splitlines()
+            if max_iter > 0:
+                img_labels = img_labels[:max_iter]
+            logger.debug(f"Loaded {len(img_labels)} labels")
+            return [label.replace(" ", "_") for label in img_labels]
+        except FileNotFoundError:
+            logger.error(f"Class text file not found: {self.CLASS_TEXTFILE}")
+            raise
 
-        logger.debug(f"Loaded {len(img_labels)} labels")
-        return [label.replace(" ", "_") for label in img_labels]
-
-    def _create_image_map(self) -> dict:
+    def _create_image_map(self) -> Dict[str, pathlib.Path]:
         """
         Create a mapping of image labels to their file paths.
 
@@ -93,7 +99,7 @@ class ImagenetDataset(BaseDataset):
         """
         return len(self.img_labels)
 
-    def __getitem__(self, idx: int) -> tuple:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
         """
         Get an item (image and label) from the dataset.
 
@@ -105,24 +111,24 @@ class ImagenetDataset(BaseDataset):
         """
         label = self.img_labels[idx]
         img_fp = self.img_map[label]
-        image = Image.open(img_fp).convert("RGB")
-        image = image.resize((224, 224))
+        try:
+            image = Image.open(img_fp).convert("RGB")
+            image = image.resize((224, 224))
 
-        if self.transform:
             image = self.transform(image)
-        else:
-            # If no transform is provided, convert to tensor manually
-            image = transforms.ToTensor()(image)
 
-        # Ensure the image is a 3D tensor (C, H, W)
-        if image.dim() == 2:
-            image = image.unsqueeze(0)
+            # Ensure the image is a 3D tensor (C, H, W)
+            if image.dim() == 2:
+                image = image.unsqueeze(0)
 
-        if self.target_transform:
-            label = self.target_transform(label)
+            if self.target_transform:
+                label = self.target_transform(label)
 
-        logger.debug(f"Retrieved item at index {idx}: label={label}")
-        return image, label
+            logger.debug(f"Retrieved item at index {idx}: label={label}")
+            return image, label
+        except Exception as e:
+            logger.error(f"Error processing image at index {idx}: {str(e)}")
+            raise
 
 
 def imagenetX(max_iter: int) -> ImagenetDataset:
