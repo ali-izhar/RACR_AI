@@ -23,7 +23,7 @@ class BaseModel(nn.Module):
         logger.info("Initializing BaseModel")
         if not config:
             repo_root = get_repo_root()
-            custom_config_path = repo_root / "config" / "model_config_template.yaml"
+            custom_config_path = repo_root / "config" / "modelsplit_template.yaml"
             if custom_config_path.exists():
                 self.config = read_yaml_file(custom_config_path)
                 logger.debug(f"Loaded custom config from {custom_config_path}")
@@ -53,18 +53,12 @@ class BaseModel(nn.Module):
         logger.debug(f"Using device: {self.device}")
 
         # Extract model-specific configurations
-        default_model_name = self.default_configs.get("default_model")
-        if not default_model_name:
-            logger.error("Default model name not specified in configuration")
-            raise ValueError(
-                "Default model name must be specified in the configuration."
-            )
-
-        self.model_config = self.config["model"].get(default_model_name)
+        model_name = list(self.config["model"].keys())[0]  # Get the first model key
+        self.model_config = self.config["model"].get(model_name)
         if not self.model_config:
-            logger.error(f"Model configuration for '{default_model_name}' not found")
+            logger.error(f"Model configuration for '{model_name}' not found")
             raise ValueError(
-                f"Model configuration for '{default_model_name}' not found."
+                f"Model configuration for '{model_name}' not found."
             )
 
         # Extract other configurations
@@ -75,19 +69,11 @@ class BaseModel(nn.Module):
         self.save_layers = self.model_config.get("save_layers", [])
 
         # Set other configurations with defaults if not specified
-        self.depth = self.model_config.get(
-            "depth", self.default_configs.get("depth", 2)
-        )
-        self.mode = self.model_config.get(
-            "mode", self.default_configs.get("mode", "eval")
-        )
-        self.flush_buffer_size = self.model_config.get(
-            "flush_buffer_size", self.default_configs.get("flush_buffer_size", 100)
-        )
-        self.warmup_iterations = self.model_config.get(
-            "warmup_iterations", self.default_configs.get("warmup_iterations", 2)
-        )
-        self.node_name = self.model_config.get("node_name", self.default_configs.get("node_name", "UNKNOWN"))
+        self.depth = self.model_config.get("depth", 2)
+        self.mode = self.model_config.get("mode", "eval")
+        self.flush_buffer_size = self.model_config.get("flush_buffer_size", 100)
+        self.warmup_iterations = self.model_config.get("warmup_iterations", 10)
+        self.node_name = self.model_config.get("node_name", "UNKNOWN")
         logger.debug(
             f"Model configurations: name={self.model_name}, mode={self.mode}, input_size={self.input_size}"
         )
@@ -99,20 +85,14 @@ class BaseModel(nn.Module):
         self._extract_dataloader_configurations()
 
     def _extract_dataset_configurations(self):
-        default_dataset_name = self.default_configs.get("default_dataset")
-        if not default_dataset_name:
-            logger.error("Default dataset name not specified in configuration")
-            raise ValueError(
-                "Default dataset name must be specified in the configuration."
-            )
-
-        self.dataset_config = self.config["dataset"].get(default_dataset_name)
+        dataset_name = list(self.config["dataset"].keys())[0]  # Get the first dataset key
+        self.dataset_config = self.config["dataset"].get(dataset_name)
         if not self.dataset_config:
             logger.error(
-                f"Dataset configuration for '{default_dataset_name}' not found"
+                f"Dataset configuration for '{dataset_name}' not found"
             )
             raise ValueError(
-                f"Dataset configuration for '{default_dataset_name}' not found."
+                f"Dataset configuration for '{dataset_name}' not found."
             )
 
         self.dataset_module = self.dataset_config.get("module")

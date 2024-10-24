@@ -13,19 +13,19 @@ if str(project_root) not in sys.path:
 from src.api.device_mgmt import DeviceMgr
 from src.api.experiment_mgmt import ExperimentManager
 from src.utils.ml_utils import DataUtils
-from src.utils.system_utils import read_yaml_file
+from src.utils.system_utils import read_yaml_file, get_repo_root
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("SERVER")
 
 class Server:
+    CONFIG_PATH: Path = get_repo_root() / "config" / "model_config.yaml"
+
     def __init__(self):
-        self.project_root = Path(__file__).resolve().parents[2]
-        self.config_path = self.project_root / "config" / "model_config.yaml"
-        self.config = read_yaml_file(self.config_path)
+        self.config = read_yaml_file(self.CONFIG_PATH)
         self.device_mgr = DeviceMgr()
-        self.experiment_mgr = ExperimentManager(self.config_path)
+        self.experiment_mgr = ExperimentManager(self.CONFIG_PATH)
         self.data_utils = DataUtils()
 
     def start(self):
